@@ -163,7 +163,7 @@ def folder_card(ctx: Ctx, fid: int):
         f"⏱ Контроль: {onoff(bool(f['delay_on']))} · 💰 штраф: <b>{f['fine'] if f['fine'] else 'не задан'}</b>\n\n"
         "<b>📣 Push</b>\n"
         f"📲 Аккаунт Push: <b>{acc_s}</b>\n"
-        f"📣 Push: {onoff(bool(f['push_on']))} · 🔢 сколько: <b>{f['push_limit'] or 'поровну из общего'}</b>\n"
+        f"📣 Push: {onoff(bool(f['push_on']))} · 🔢 сколько: <b>{f['push_limit'] or 'общее число'}</b>\n"
         f"🌙 Не слать Push в: <b>{quiet}</b>\n\n"
         "<i>✅ — ID сотрудника определён, ⏳ — определится сам. Аккаунт Push должен состоять в чатах этой папки.</i>"
     )
@@ -345,8 +345,8 @@ def push_menu(ctx: Ctx):
         "📣 <b>Push — горячие лиды</b>\n\n"
         "Нажмёте «🚀 Разослать» — Push уйдёт во ВСЕ папки сразу, каждая со своего аккаунта:\n\n"
         f"{plan_lines(ctx, aud)}\n\n"
-        f"Всего: <b>{len(aud['threads'])}</b> · общее число на папку без своего лимита: "
-        f"<b>{limit if limit else 'все'}</b> (поровну)\n"
+        f"Всего: <b>{len(aud['threads'])}</b> · число на КАЖДУЮ папку (без своего): "
+        f"<b>{limit if limit else 'все'}</b> на каждую папку\n"
         f"📎 Вложение: <b>{media_label(ctx)}</b>\n"
         f"<b>Текст:</b> {preview}"
     )
@@ -658,7 +658,7 @@ def push_folders(ctx: Ctx):
         rows.append([(("✅ " if on else "⬜ ") + f["name"] + ("" if f["push_on"] else " (Push выкл)"), f"p:fold:{f['id']}")])
     rows += [[("✅ Все папки", "p:fold:all")], [("⬅️ Назад", "p:menu")]]
     text = ("📁 <b>Папки для Push</b>\n\nОтметьте папки, которым слать Push. Каждая папка пойдёт через свой аккаунт "
-            "(Меню → Аккаунты Push), аккаунты работают параллельно. Количество делится поровну между отмеченными папками.")
+            "(Меню → Аккаунты Push), аккаунты работают параллельно. Число Push задаётся на каждую папку (150 = по 150 в каждой).")
     return text, kb(*rows)
 
 
@@ -677,7 +677,7 @@ def proyob_screen(ctx: Ctx):
         "🚨 <b>Проёб — контроль задержек</b>\n\n"
         f"Следит за чатами: основной аккаунт — {STATE_LABELS.get(ub.state, ub.state)}"
         + (f" ({h(ub.me_label)})" if ub.me_label else "") + "\n"
-        f"Куда писать: группа «Проёб» <code>{h(group)}</code>\n"
+        f"Куда писать: группа «Проёб» <code>{h(group)}</code> · пишет: <b>{via_label(ctx)}</b>\n"
         f"Контроль: {onoff(feature_on(db, 'delay_enabled'))} · лимит <b>{db.get('limit_minutes')} мин</b> · "
         f"рабочий день <b>{db.get('work_start')}–{db.get('work_end')}</b>\n\n"
         "<b>Кого отмечать в каждой папке:</b>\n" + ("\n".join(lines) if lines else "<i>папок нет</i>")
@@ -689,10 +689,35 @@ def proyob_screen(ctx: Ctx):
         [("➕ Добавить папку", "f:add"), ("🔄 Подтянуть чаты", "f:sync")],
         [("👥 Группа «Проёб»", "s:group"), ("🔎 Найти чат / ID", "x:find")],
         [("⏱ Лимит ответа", "s:limit"), ("🕒 Рабочий день", "s:hours")],
-        [("🔑 Основной аккаунт", "a:menu")],
+        [("📤 Кто пишет в «Проёб»", "pr:via"), ("🔑 Основной аккаунт", "a:menu")],
         [("💳 Оплата", "pay:menu"), ("⚙️ Ещё настройки", "s:more")],
         [("⬅️ Назад", "m")],
     ]
+    return text, kb(*rows)
+
+
+def via_label(ctx: Ctx) -> str:
+    via = ctx.db.get("alert_via") or "bot"
+    if via == "main":
+        return "🔑 основной аккаунт"
+    if via.startswith("acc:"):
+        a = ctx.db.account(int(via[4:])) if via[4:].isdigit() else None
+        return f"📲 {h(a['name'])}" if a else "🤖 бот"
+    return "🤖 бот"
+
+
+def via_pick(ctx: Ctx):
+    via = ctx.db.get("alert_via") or "bot"
+    def mark(v): return "✅ " if via == v else ""
+    rows = [[(f"{mark('bot')}🤖 Бот", "pr:viaset:bot")],
+            [(f"{mark('main')}🔑 Основной аккаунт", "pr:viaset:main")]]
+    for a in ctx.db.accounts():
+        rows.append([(f"{mark('acc:' + str(a['id']))}📲 {a['name']}", f"pr:viaset:acc{a['id']}")])
+    rows.append([("⬅️ Назад", "pr:menu")])
+    text = ("📤 <b>Кто пишет в «Проёб»</b>\n\nСейчас: <b>" + via_label(ctx) + "</b>\n\n"
+            "Выберите, от чьего имени приходят уведомления о задержках и напоминания. Аккаунт должен состоять в группе «Проёб». "
+            "Если аккаунт не в сети или не в группе — напишет бот.\n\n"
+            "<i>У аккаунта нет кнопки «✅ Выполнено»: уведомление закрывается само, когда менеджер ответил.</i>")
     return text, kb(*rows)
 
 

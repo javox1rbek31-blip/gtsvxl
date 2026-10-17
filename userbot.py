@@ -276,12 +276,12 @@ class Userbot:
         except Exception:
             log.exception("Ошибка обработки сообщения (метаданные)")
 
-    async def _is_bot_sender(self, m) -> bool:
+    async def _is_bot_sender(self, m) -> bool | None:
         """Отправитель — бот (посредник: ставки, «Реквизиты…»)? Смотрим только флаг «бот» у отправителя, не текст."""
         try:
             sid = m.sender_id
             if sid is None or m.out:
-                return False
+                return None
             mid = self.db.get_int("midbot_id")
             if mid and sid == mid:
                 return True
@@ -293,12 +293,13 @@ class Userbot:
             sender = getattr(m, "sender", None)
             if sender is None:
                 sender = await asyncio.wait_for(m.get_sender(), timeout=3)
+            if sender is None:
+                return None                              # не знаем — ведём себя как раньше
             flag = bool(getattr(sender, "bot", False))
-            if sender is not None:
-                cache[sid] = flag
+            cache[sid] = flag
             return flag
         except Exception:
-            return False
+            return None
 
     def _is_requisites(self, m) -> bool:
         """ЕДИНСТВЕННОЕ место, где читается текст: только сообщения бота-посредника (его ID задан в настройках)
@@ -430,6 +431,7 @@ class Userbot:
             await self.monitor.reconcile_top(
                 d.id, 0, int(m.id), int(m.date.timestamp()), m.sender_id, bool(m.out),
                 getattr(m, "action", None) is not None, from_bot=await self._is_bot_sender(m),
+                bet=bool(getattr(m, "video_note", None)),
             )
         self.monitor.reload()
         for chat_id, peer in forums:
@@ -479,6 +481,7 @@ class Userbot:
                     await self.monitor.reconcile_top(
                         chat_id, int(t.id), int(m.id), int(m.date.timestamp()), m.sender_id, bool(m.out),
                         getattr(m, "action", None) is not None, from_bot=await self._is_bot_sender(m),
+                        bet=bool(getattr(m, "video_note", None)),
                     )
                 total += 1
             last = res.topics[-1]

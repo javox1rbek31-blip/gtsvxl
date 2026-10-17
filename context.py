@@ -34,6 +34,7 @@ class Ctx:
     pool: Any = None
     flash_seconds: float = 6.0
     last_week_cmd: int = 0
+    last_sticker_ts: float = 0.0
     started_at: float = field(default_factory=time.time)
     logins: dict[int, LoginFlow] = field(default_factory=dict)
     _tasks: set = field(default_factory=set)

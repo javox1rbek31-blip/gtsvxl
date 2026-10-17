@@ -213,6 +213,8 @@ class Database:
                          ("quiet_to", "TEXT NOT NULL DEFAULT ''")):
             if col not in fcols:
                 self._conn.execute(f"ALTER TABLE folders ADD COLUMN {col} {ddl}")
+        if "first_lead_msg_id" not in {r[1] for r in self._conn.execute("PRAGMA table_info(thread_state)")}:
+            self._conn.execute("ALTER TABLE thread_state ADD COLUMN first_lead_msg_id INTEGER")
         if "paused" not in {r[1] for r in self._conn.execute("PRAGMA table_info(accounts)")}:
             self._conn.execute("ALTER TABLE accounts ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
         acols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
@@ -424,16 +426,18 @@ class Database:
             row = self.state(chat_id, topic_id)
             if row is None:
                 self.execute(
-                    "INSERT INTO thread_state(chat_id, topic_id, status, last_lead_msg_id, last_lead_ts, pending_since) "
-                    "VALUES(?, ?, 'pending', ?, ?, ?)",
-                    (chat_id, topic_id, msg_id, ts, ts),
+                    "INSERT INTO thread_state(chat_id, topic_id, status, last_lead_msg_id, last_lead_ts, pending_since, "
+                    "first_lead_msg_id) VALUES(?, ?, 'pending', ?, ?, ?, ?)",
+                    (chat_id, topic_id, msg_id, ts, ts, msg_id),
                 )
                 return
-            since = ts if (restart_streak or row["status"] != "pending" or row["pending_since"] is None) else row["pending_since"]
+            fresh = restart_streak or row["status"] != "pending" or row["pending_since"] is None
+            since = ts if fresh else row["pending_since"]
+            first = msg_id if (fresh or not row["first_lead_msg_id"]) else row["first_lead_msg_id"]
             self.execute(
                 "UPDATE thread_state SET status='pending', last_lead_msg_id=?, last_lead_ts=?, "
-                "pending_since=?, alert_id=NULL WHERE chat_id=? AND topic_id=?",
-                (msg_id, ts, since, chat_id, topic_id),
+                "pending_since=?, first_lead_msg_id=?, alert_id=NULL WHERE chat_id=? AND topic_id=?",
+                (msg_id, ts, since, first, chat_id, topic_id),
             )
 
     def set_idle(self, chat_id: int, topic_id: int, ts: int) -> bool:
@@ -497,14 +501,18 @@ class Database:
         col = "bet_count" if bet else "msg_count"
         self.execute(f"UPDATE leads SET {col}={col}+1 WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
 
-    def silent_bot_threads(self, since_first: int, max_count: int, idle_before: int) -> list[sqlite3.Row]:
-        """Новые нити, где пришло меньше ожидаемого числа сообщений и давно тишина."""
+    def silent_bot_threads(self, since_first: int, max_count: int, first_before: int) -> list[sqlite3.Row]:
+        """Новые нити, где к назначенному сроку пришло меньше ожидаемого числа ставок (кружков)."""
         return self.all(
             "SELECT l.*, COALESCE(c.title,'') AS chat_title, COALESCE(t.title,'') AS topic_title "
             "FROM leads l JOIN chats c ON c.chat_id=l.chat_id "
             "LEFT JOIN topics t ON t.chat_id=l.chat_id AND t.topic_id=l.topic_id "
-            "WHERE l.first_seen>=? AND l.bet_count<? AND l.last_seen<=? AND l.watch_warned=0",
-            (since_first, max_count, idle_before))
+            "WHERE l.first_seen>=? AND l.bet_count<? AND l.first_seen<=? AND l.watch_warned=0",
+            (since_first, max_count, first_before))
+
+    def lead_bets(self, chat_id: int, topic_id: int) -> tuple[int, int] | None:
+        r = self.one("SELECT first_seen, bet_count FROM leads WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
+        return (int(r["first_seen"]), int(r["bet_count"])) if r else None
 
     def mark_newlead_warned(self, chat_id: int, topic_id: int) -> None:
         self.execute("UPDATE leads SET newlead_warned=1 WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))

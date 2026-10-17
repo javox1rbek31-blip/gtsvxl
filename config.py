@@ -31,6 +31,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "push_limit": "50",             # сколько человек за один Push (0 = все подходящие)
     "push_speed": "normal",         # fast 1–2 с · normal 2–3 с · slow 3–5 с
     "push_newlead_minutes": "60",   # не слать Push новым лидам первые N минут (автоставки)
+    "alert_via": "bot",             # кто пишет в «Проёб»: bot | main | acc:<id>
     "lang": "ru",                   # язык панели: ru / uz
     "push_quiet_from": "",          # общее «тихое время» Push, например 21:00
     "push_quiet_to": "",            # …до 09:00

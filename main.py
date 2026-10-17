@@ -121,6 +121,8 @@ async def amain() -> None:
     ctx.pool = AccountPool(cfg, db, notifier, tz, userbot)
     ctx.pool.sync()
     broadcaster.pool = ctx.pool
+    notifier.userbot = userbot
+    notifier.pool = ctx.pool
     ctx.services.pool = ctx.pool
 
     dp = Dispatcher(storage=MemoryStorage())

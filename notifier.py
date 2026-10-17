@@ -44,6 +44,36 @@ class BotNotifier(Notifier):
         self.db = db
         self.admin_ids = admin_ids
         self._last_admin_note: dict[str, float] = {}
+        self.userbot = None                       # основной аккаунт (может писать в «Проёб» вместо бота)
+        self.pool = None                          # аккаунты Push
+
+    # ------------------------------------------------------------ кто пишет в «Проёб»
+    def _via_client(self):
+        """Telethon-клиент выбранного аккаунта (настройка alert_via: bot | main | acc:<id>) или None → пишет бот."""
+        via = (self.db.get("alert_via") or "bot").strip()
+        acc = None
+        if via == "main":
+            acc = self.userbot
+        elif via.startswith("acc:") and self.pool is not None:
+            try:
+                acc = self.pool.sender(int(via[4:]))
+            except ValueError:
+                acc = None
+        if acc is not None and getattr(acc, "state", "") == "online" and getattr(acc, "client", None) is not None:
+            return acc.client
+        return None
+
+    async def _client_send(self, text: str) -> tuple[int, int] | None:
+        client = self._via_client()
+        if client is None:
+            return None
+        try:
+            gid = self.group_id()
+            msg = await client.send_message(gid, text, parse_mode=None, link_preview=False)
+            return gid, int(msg.id)
+        except Exception as exc:                  # аккаунт не в группе / нет кэша — упадём обратно на бота
+            log.warning("Аккаунт не смог написать в «Проёб» (%s), пишет бот", type(exc).__name__)
+            return None
 
     # ------------------------------------------------------------ служебное
     def group_id(self) -> int:
@@ -76,6 +106,10 @@ class BotNotifier(Notifier):
     async def send_alert(self, text: str, alert_id: int) -> tuple[int, int]:
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
+        sent = await self._client_send(text)          # у аккаунта нет кнопки «Выполнено» — закрывается ответом менеджера
+        if sent is not None:
+            return sent
+
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done:{alert_id}")]]
         )
@@ -93,6 +127,14 @@ class BotNotifier(Notifier):
     async def edit_alert(self, chat_id: int, message_id: int, text: str) -> None:
         from aiogram.types import LinkPreviewOptions
 
+        client = self._via_client()
+        if client is not None:
+            try:
+                await client.edit_message(chat_id, message_id, text, parse_mode=None, link_preview=False)
+                return
+            except Exception:
+                pass                                   # сообщение писал бот (или наоборот) — правим ботом
+
         async def go():
             await self.bot.edit_message_text(
                 text, chat_id=chat_id, message_id=message_id,
@@ -103,6 +145,9 @@ class BotNotifier(Notifier):
 
     async def send_group_text(self, text: str) -> None:
         from aiogram.types import LinkPreviewOptions
+
+        if await self._client_send(text) is not None:
+            return
 
         async def go():
             await self.bot.send_message(

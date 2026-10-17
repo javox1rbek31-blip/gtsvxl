@@ -628,9 +628,12 @@ def build_admin_router(ctx: Ctx) -> Router:
             return None
 
         if act == "push_text":
-            if not text or len(text) > 3500:
-                return "Текст: от 1 до 3500 символов."
-            db.set("push_text", text)
+            if text in ("-", "—", "0"):                       # убрать текст (например, оставить только голосовое/кружок)
+                db.set("push_text", "")
+            elif not text or len(text) > 3500:
+                return "Текст: от 1 до 3500 символов. Пришлите <code>-</code>, чтобы убрать текст."
+            else:
+                db.set("push_text", text)
             await after_push_edit(message, state, data)
             return None
 
@@ -841,7 +844,19 @@ def build_admin_router(ctx: Ctx) -> Router:
             await show(cb, *S.main(ctx, rk))
         elif key == "pr":
             await state.clear()
-            await show(cb, *S.proyob_screen(ctx))
+            if arg == "via":
+                await show(cb, *S.via_pick(ctx))
+            elif arg == "viaset":
+                v = p[2] if len(p) > 2 else "bot"
+                if v.startswith("acc") and v[3:].isdigit() and db.account(int(v[3:])):
+                    db.set("alert_via", "acc:" + v[3:])
+                elif v == "main":
+                    db.set("alert_via", "main")
+                else:
+                    db.set("alert_via", "bot")
+                await show(cb, *S.via_pick(ctx))
+            else:
+                await show(cb, *S.proyob_screen(ctx))
         elif key == "st":
             await show(cb, *S.status(ctx))
         elif key == "help":
@@ -884,7 +899,7 @@ def build_admin_router(ctx: Ctx) -> Router:
                 if f is None:
                     return "Папка не найдена"
                 await prompt(cb, state, "set_plim",
-                             f"🔢 Сколько Push для папки <b>{h(f['name'])}</b> за один раз (сейчас: {f['push_limit'] or 'поровну из общего'}). "
+                             f"🔢 Сколько Push для папки <b>{h(f['name'])}</b> за один раз (сейчас: {f['push_limit'] or 'общее число'}). "
                              "Например <code>50</code>. <code>0</code> — не задавать (брать из общего количества).",
                              f"f:o:{p[2]}", fid=int(p[2]))
             elif arg == "quiet":
@@ -1019,7 +1034,7 @@ def build_admin_router(ctx: Ctx) -> Router:
                 await state.clear()
                 await show(cb, *S.push_menu(ctx))
             elif arg == "text":
-                await prompt(cb, state, "push_text", "✏️ Пришлите текст Push (до 3500 символов).", "p:menu")
+                await prompt(cb, state, "push_text", "✏️ Пришлите текст Push (до 3500 символов). Пришлите <code>-</code>, чтобы убрать текст (если есть медиа — уйдёт только оно).", "p:menu")
             elif arg == "limit":
                 await prompt(cb, state, "push_limit",
                              f"🔢 Сейчас: <b>{db.get('push_limit')}</b>. Сколько человек за один Push? "
@@ -1286,7 +1301,7 @@ def build_admin_router(ctx: Ctx) -> Router:
             elif arg == "stop":
                 if ctx.broadcaster.running:
                     ctx.broadcaster.stop()
-                    return "Останавливаю после текущего сообщения…"
+                    return "Останавливаю…"
                 return "Сейчас рассылки нет."
             elif arg == "log":
                 await show(cb, *S.broadcast_log(ctx))

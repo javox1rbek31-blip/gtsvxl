@@ -27,6 +27,7 @@ from .worktime import local_day_start, parse_date
 log = logging.getLogger("broadcast")
 
 MIN_DELAY = 2.0
+MIN_REPEAT_MINUTES = 180          # всегда: тем, кому Push ушёл за последние 3 часа, повторно не шлём
 MAX_DELAY = 3.0
 PROGRESS_EVERY = 5
 SPEEDS = {"fast": (1.0, 2.0), "normal": (2.0, 3.0), "slow": (3.0, 5.0)}
@@ -35,15 +36,11 @@ Progress = Callable[[int, int, int], Awaitable[None]]
 
 
 def split_quota(avail: dict[int, int], limit: int) -> dict[int, int]:
-    """Лимит делится ПОРОВНУ между папками. Если у папки лидов меньше её доли — остаток НЕ передаётся другим.
-    avail включает все выбранные папки (в том числе пустые). limit=0 — без ограничения."""
+    """Число Push — НА КАЖДУЮ папку (150 = по 150 в каждой), а не делится между папками.
+    Если лидов в папке меньше — уходит сколько есть. limit=0 — без ограничения."""
     if limit <= 0:
         return dict(avail)
-    ids = sorted(avail)
-    if not ids:
-        return {}
-    base, extra = divmod(limit, len(ids))
-    return {f: min(avail[f], base + (1 if i < extra else 0)) for i, f in enumerate(ids)}
+    return {f: min(n, limit) for f, n in avail.items()}
 
 
 def _hm(raw: str) -> int | None:
@@ -64,7 +61,7 @@ def in_quiet(frm: str, to: str, minute_of_day: int) -> bool:
 
 
 def split_with_own(avail: dict[int, int], own: dict[int, int], limit: int) -> dict[int, int]:
-    """Папки со своим числом (own>0) берут его; остальные делят общий лимит поровну (0 = все)."""
+    """Папки со своим числом (own>0) берут его; остальные получают общее число (на каждую папку, 0 = все)."""
     out = {f: min(avail[f], own[f]) for f in avail if own.get(f, 0) > 0}
     rest = {f: avail[f] for f in avail if f not in out}
     out.update(split_quota(rest, limit))
@@ -123,7 +120,7 @@ class Broadcaster:
 
     def audience(self, mode: str, now: int | None = None) -> dict:
         """Кому уйдёт Push. Порядок: новые лиды → вчерашние → за прошлую неделю → старые.
-        Лимит делится ПОРОВНУ между выбранными папками. Фильтры: статус-эмодзи, период, папки,
+        Число Push задаётся НА КАЖДУЮ папку. Фильтры: статус-эмодзи, период, папки,
         «новый лид» (ждём автоставки), «недавно писали», «уже получал», режим дня/вечера."""
         now = int(time.time()) if now is None else now
         push_e, skip_e = emoji_lists(self.db)
@@ -169,7 +166,7 @@ class Broadcaster:
             cooled = len(rows) - len(kept)
             rows = kept
 
-        repeat = max(0, self.db.get_int("push_repeat_minutes"))
+        repeat = max(MIN_REPEAT_MINUTES, self.db.get_int("push_repeat_minutes"))   # после сбоя/FloodWait не слать повторно
         repeated = 0
         if repeat:
             border = now - repeat * 60
@@ -229,7 +226,10 @@ class Broadcaster:
         return max(1, round(n * (lo + hi + 1.0) / 2 / 60))
 
     def stop(self) -> None:
+        """Немедленная остановка: флаг + отмена всех рабочих (в т.ч. посреди FloodWait-ожидания)."""
         self._stop = True
+        for t in list(getattr(self, "_workers", [])):
+            t.cancel()
 
     # ------------------------------------------------------------ запуск
     def sender_name(self, folder_id: int) -> str:
@@ -319,7 +319,14 @@ class Broadcaster:
 
         status = "done"
         try:
-            await asyncio.gather(*(worker(k, g) for k, g in groups.items()))
+            self._workers = [asyncio.create_task(worker(k, g)) for k, g in groups.items()]
+            results = await asyncio.gather(*self._workers, return_exceptions=True)
+            for res in results:
+                if isinstance(res, asyncio.CancelledError):
+                    if not self._stop:
+                        raise res                     # отмена не по кнопке «Стоп» (выключение бота) — пробрасываем
+                elif isinstance(res, Exception):
+                    log.error("Рабочий рассылки упал: %r", res)
             if self._stop:
                 status = "stopped"
             elif stat["aborted"] and not stat["sent"]:
@@ -332,6 +339,7 @@ class Broadcaster:
             self.db.finish_broadcast(bid, status, int(time.time()))
             self.running = False
             self.current_id = None
+            self._workers = []
 
         folder_lines = []
         for fid, (ok, bad) in per_folder.items():

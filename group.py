@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import random
+import time
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -74,6 +76,24 @@ def build_group_router(ctx: Ctx) -> Router:
         who = f"@{user.username}" if user.username else user.full_name
         ok = await ctx.monitor.press_done(alert_id, who)
         await cb.answer("Отмечено как выполненное ✅" if ok else "Уже закрыто")
+
+    @r.message(F.chat.type.in_({"group", "supergroup"}), F.sticker)
+    async def on_group_sticker(message: Message) -> None:
+        """Кто-то прислал стикер в «Проёб» — отвечаем случайным стикером из того же набора (не чаще раза в минуту)."""
+        gid = proyob_id()
+        if gid is None or message.chat.id != gid or message.from_user is None or message.from_user.is_bot:
+            return
+        now = time.time()
+        if now - ctx.last_sticker_ts < 60:
+            return
+        ctx.last_sticker_ts = now
+        try:
+            name = message.sticker.set_name
+            pool = (await message.bot.get_sticker_set(name)).stickers if name else []
+            pick = random.choice(pool) if pool else message.sticker
+            await message.answer_sticker(pick.file_id)
+        except Exception:
+            log.info("Не удалось ответить стикером")
 
     @r.message(F.chat.type.in_({"group", "supergroup"}), F.text)
     async def on_group_text(message: Message) -> None:

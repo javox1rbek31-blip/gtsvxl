@@ -25,7 +25,7 @@ MAX_LINKS_PER_ALERT = 30
 CACHE_TTL = 30
 
 
-BET_WINDOW = 30      # сек: текст ставки приходит рядом с кружком
+BET_GAP_MIN = 13       # мин между автоставками
 
 
 class Monitor:
@@ -35,7 +35,6 @@ class Monitor:
         self.notifier = notifier
         self.breaks = breaks
         self.clock = clock
-        self._bet_ts: dict[tuple[int, int], int] = {}
         self._chat_ids: set[int] = set()
         self._emp_ids: set[int] = set()
         self._push_ids: set[int] = set()
@@ -77,7 +76,7 @@ class Monitor:
     # ------------------------------------------------------------ события
     async def handle_message(self, chat_id: int, topic_id: int, msg_id: int, ts: int, sender_id: int | None,
                              out: bool, service: bool = False, bet: bool = False,
-                             proof: bool = False, requisites: bool = False, from_bot: bool = False) -> None:
+                             proof: bool = False, requisites: bool = False, from_bot: bool | None = None) -> None:
         """bet=True — сообщение-кружок (ставка посредника): считаем по ТИПУ вложения, текст не читаем.
         topic_id: id топика форума (лид = топик) либо 0 для обычного чата."""
         self._fresh()
@@ -95,7 +94,10 @@ class Monitor:
                 self.db.start_payment(chat_id, topic_id, ts)
             return
 
-        if out or (sender_id is not None and sender_id in self._emp_ids):
+        # Клиенты пишут ТОЛЬКО через бота-посредника, поэтому любой живой человек (не бот) — сотрудник:
+        # отвечать может не только закреплённый за папкой, но и любой другой.
+        human = from_bot is False and sender_id is not None
+        if out or human or (sender_id is not None and sender_id in self._emp_ids):
             self.db.done_payment(chat_id, topic_id)   # сотрудник написал — напоминать клиенту не нужно
             if state is not None and state["last_lead_ts"] and ts < state["last_lead_ts"]:
                 return                                 # ответ старше последнего сообщения лида
@@ -113,17 +115,8 @@ class Monitor:
         if feature_on(self.db, "leads_enabled"):
             self.db.touch_lead(chat_id, topic_id, sender_id, msg_id, ts)
             self.db.bump_count(chat_id, topic_id, bet)
-        if from_bot:
-            # ВСЕ сообщения клиентов приходят через бота-посредника, поэтому «бот» ≠ «ставка».
-            # Ставка = кружок + текст рядом (в пределах BET_WINDOW секунд): их таймер задержки не запускает.
-            key = (chat_id, topic_id)
-            if bet:
-                self._bet_ts[key] = ts
-                if state is not None and state["status"] == "pending" and (state["pending_since"] or 0) >= ts - BET_WINDOW:
-                    self.db.set_idle(chat_id, topic_id, ts)      # текст ставки пришёл чуть раньше кружка — снимаем
-                return
-            if ts - self._bet_ts.get(key, -10**9) <= BET_WINDOW:
-                return
+        if from_bot and bet:
+            return        # кружок-ставку шлёт бот-посредник (текст ставки пишет менеджер): лид считаем, таймер не запускаем
         restart = state is not None and (
             state["status"] == "alerted"
             or (state["status"] == "pending" and (state["pending_since"] or 0) < self.db.get_int("alerts_from")))
@@ -145,7 +138,7 @@ class Monitor:
             log.exception("Не удалось записать ответ для отчёта")
 
     async def reconcile_top(self, chat_id: int, topic_id: int, msg_id: int, ts: int, sender_id: int | None,
-                            out: bool, service: bool, from_bot: bool = False) -> None:
+                            out: bool, service: bool, from_bot: bool | None = None, bet: bool = False) -> None:
         """Сверка по последнему сообщению нити (страховка от пропущенных событий)."""
         self._fresh()
         if not master_on(self.db) or chat_id not in self._chat_ids or service:
@@ -153,16 +146,16 @@ class Monitor:
         if sender_id is not None and sender_id in self._push_ids:
             return
         state = self.db.state(chat_id, topic_id)
-        is_employee = out or (sender_id is not None and sender_id in self._emp_ids)
+        is_employee = out or (from_bot is False and sender_id is not None) or (sender_id is not None and sender_id in self._emp_ids)
         if is_employee:
             if state is not None and state["status"] in ("pending", "alerted"):
-                await self.handle_message(chat_id, topic_id, msg_id, ts, sender_id, out)
+                await self.handle_message(chat_id, topic_id, msg_id, ts, sender_id, out, from_bot=from_bot)
             else:
                 self.db.touch_activity(chat_id, topic_id, ts)
             return
         if state is not None and state["last_lead_msg_id"] == msg_id:
             return                                     # это сообщение уже учтено
-        await self.handle_message(chat_id, topic_id, msg_id, ts, sender_id, out, from_bot=from_bot)
+        await self.handle_message(chat_id, topic_id, msg_id, ts, sender_id, out, bet=bet, from_bot=from_bot)
 
     # ------------------------------------------------------------ закрытие алертов
     async def _resolve_replied(self, chat_id: int, topic_id: int) -> None:
@@ -208,6 +201,22 @@ class Monitor:
                 paused += work_seconds_between(lo, hi, self.tz, ws, we)
         return max(0, total - paused)
 
+    def bet_deadline(self, first_seen: int) -> int:
+        """До какого момента лид считается «в ставках»: ставки идут ~13 мин друг за другом + запас botwatch_wait."""
+        need = max(1, self.db.get_int("botwatch_count"))
+        wait = max(1, self.db.get_int("botwatch_wait"))
+        return first_seen + ((need - 1) * BET_GAP_MIN + wait) * 60
+
+    def in_bet_phase(self, chat_id: int, topic_id: int, now: int) -> bool:
+        """Идёт период автоставок: все 3 ещё не пришли и срок не вышел. Тогда это не «задержка» — при проблеме
+        со ставками придёт напоминание «ставка» (watch_bots)."""
+        if not feature_on(self.db, "botwatch_enabled"):
+            return False
+        lead = self.db.lead_bets(chat_id, topic_id)
+        if lead is None or lead[0] < self.db.get_int("botwatch_from"):
+            return False
+        return lead[1] < max(1, self.db.get_int("botwatch_count")) and now < self.bet_deadline(lead[0])
+
     async def tick(self, now: int | None = None) -> int:
         """Проверить все ожидающие чаты. Возвращает число отправленных алертов."""
         now = int(now if now is not None else self.clock())
@@ -240,6 +249,8 @@ class Monitor:
             fid = row["folder_id"]
             if fid in off:
                 continue
+            if self.in_bet_phase(row["chat_id"], row["topic_id"], now):    # идут автоставки — не задержка
+                continue
             if fid not in pauses:
                 pauses[fid] = self.db.pauses(fid, 0)
             if self.elapsed(fid, ref, now, pauses[fid]) >= limit:
@@ -259,7 +270,7 @@ class Monitor:
         folder = self.db.folder(folder_id)
         if folder is None:
             return True
-        lines = [message_link(r["chat_id"], r["last_lead_msg_id"], r["topic_id"]) for r in rows]
+        lines = [message_link(r["chat_id"], r["first_lead_msg_id"] or r["last_lead_msg_id"], r["topic_id"]) for r in rows]
         who = " ".join(mention(e["username"]) for e in self.db.employees(folder_id))
         footer = f"{who} {folder['name']} задержка".strip()
         text = "\n".join(lines + [footer])
@@ -290,8 +301,9 @@ class Monitor:
         if not feature_on(self.db, "botwatch_enabled"):
             return 0
         need = self.db.get_int("botwatch_count")             # сколько кружков-ставок должно прийти
-        wait = max(1, self.db.get_int("botwatch_wait")) * 60
-        rows = self.db.silent_bot_threads(self.db.get_int("botwatch_from"), need, now - wait)
+        wait = max(1, self.db.get_int("botwatch_wait"))
+        cut = now - ((max(1, need) - 1) * BET_GAP_MIN + wait) * 60       # ставки должны были прийти к этому сроку
+        rows = self.db.silent_bot_threads(self.db.get_int("botwatch_from"), need, cut)
         sent = 0
         for r in rows:
             if r["topic_id"] and r["topic_id"] > 1:
